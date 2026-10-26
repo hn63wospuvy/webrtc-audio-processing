@@ -18,6 +18,10 @@ const MACOSX_DEPLOYMENT_TARGET_VAR: &str = "MACOSX_DEPLOYMENT_TARGET";
 /// Symbol prefix for the webrtc-audio-processing library to allow multiple versions to coexist.
 const SYMBOL_PREFIX: &str = "v2_";
 
+fn msvc() -> bool {
+    env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|target_env| target_env == "msvc")
+}
+
 fn out_dir() -> PathBuf {
     std::env::var("OUT_DIR").expect("OUT_DIR environment var not set.").into()
 }
@@ -198,12 +202,24 @@ mod webrtc {
         );
 
         // Copy the sources to under out directory so that we can patch it without consequences.
-        let mut cp = Command::new("cp");
-        // Copy recursively, preserve attributes. Use trailing dot trick to prevent creating
-        // `webrtc-audio-processing/webrtc-audio-processing` nesting on a 2nd invocation.
-        cp.arg("-a").arg(bundled_source_path.join(".")).arg(&webrtc_source_dir);
-        let status = cp.status().context("executing cp")?;
-        assert!(status.success(), "Command failed: {:?}", &cp);
+        if msvc() {
+            // MSVC hosts have no `cp`; copy in-process instead.
+            std::fs::create_dir_all(&webrtc_source_dir)?;
+            let options = fs_extra::dir::CopyOptions::new().overwrite(true).content_only(true);
+            fs_extra::dir::copy(bundled_source_path, &webrtc_source_dir, &options)?;
+            // A static archive must not carry dllexport directives into the final executable.
+            let meson_build = webrtc_source_dir.join("meson.build");
+            let script = std::fs::read_to_string(&meson_build)?
+                .replace("'-DWEBRTC_ENABLE_SYMBOL_EXPORT',", "");
+            std::fs::write(&meson_build, script)?;
+        } else {
+            let mut cp = Command::new("cp");
+            // Copy recursively, preserve attributes. Use trailing dot trick to prevent creating
+            // `webrtc-audio-processing/webrtc-audio-processing` nesting on a 2nd invocation.
+            cp.arg("-a").arg(bundled_source_path.join(".")).arg(&webrtc_source_dir);
+            let status = cp.status().context("executing cp")?;
+            assert!(status.success(), "Command failed: {:?}", &cp);
+        }
 
         #[cfg(feature = "experimental-unlink-ns")]
         apply_patch("unlink-multichannel-noise-suppression-filters.patch")?;
@@ -218,6 +234,10 @@ mod webrtc {
             meson.arg(format!("-Dcpp_link_args={}", link_args));
         }
 
+        if msvc() {
+            // MSVC rejects the designated initializers GCC/Clang accept in C++17.
+            meson.arg("-Dcpp_std=c++20");
+        }
         let status = meson
             .arg("-Ddefault_library=static")
             .arg(webrtc_build_dir.as_os_str())
@@ -356,7 +376,8 @@ fn main() -> Result<()> {
 
     // Prefix defined symbols in the webrtc library (bundled builds only)
     // Returns the list of renamed symbols to update wrapper references later
-    let renamed_symbols = webrtc::prefix_library_symbols(&lib_dirs, SYMBOL_PREFIX)?;
+    let renamed_symbols =
+        if msvc() { vec![] } else { webrtc::prefix_library_symbols(&lib_dirs, SYMBOL_PREFIX)? };
 
     for dir in &lib_dirs {
         println!("cargo:rustc-link-search=native={}", dir.display());
@@ -400,8 +421,8 @@ fn main() -> Result<()> {
         .cpp(true)
         .file("src/wrapper.cpp")
         .includes(&include_dirs)
-        .flag("-std=c++17")
-        .flag("-Wno-unused-parameter")
+        .std(if msvc() { "c++20" } else { "c++17" })
+        .flag_if_supported("-Wno-unused-parameter")
         .out_dir(out_dir());
 
     // Inform wrapper code that headers for internal classes (ResidualEchoDetector) are available.
@@ -417,14 +438,26 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/wrapper.cpp");
 
     // Prefix the wrapper library's references to webrtc symbols to match the renamed webrtc library.
-    let wrapper_lib = out_dir().join("libwebrtc_audio_processing_wrapper.a");
+    let wrapper_lib = out_dir().join(if msvc() {
+        "webrtc_audio_processing_wrapper.lib"
+    } else {
+        "libwebrtc_audio_processing_wrapper.a"
+    });
     if wrapper_lib.exists() {
         prefix_archive_symbols(&wrapper_lib, &renamed_symbols, SYMBOL_PREFIX)?;
     }
 
     if cfg!(feature = "bundled") {
-        println!("cargo:rustc-link-lib=static={LIB_NAME}");
-        println!("cargo:rustc-link-lib=absl_strings");
+        if msvc() {
+            // Meson names static archives lib*.a on every platform.
+            println!("cargo:rustc-link-lib=static:+verbatim=lib{LIB_NAME}.a");
+            println!("cargo:rustc-link-lib=static:+verbatim=libabsl_strings.a");
+            // rtc::SystemTimeNanos uses timeGetTime.
+            println!("cargo:rustc-link-lib=winmm");
+        } else {
+            println!("cargo:rustc-link-lib=static={LIB_NAME}");
+            println!("cargo:rustc-link-lib=absl_strings");
+        }
     } else {
         println!("cargo:rustc-link-lib=dylib={LIB_NAME}");
     }
@@ -433,6 +466,8 @@ fn main() -> Result<()> {
     let mut builder = bindgen::Builder::default()
         .header("src/wrapper.hpp")
         .clang_args(&["-x", "c++", "-std=c++17", "-fparse-all-comments"])
+        // bindgen only parses headers; an older libclang may still read the MSVC STL.
+        .clang_args(if msvc() { &["-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"][..] } else { &[] })
         .generate_comments(true)
         .enable_cxx_namespaces();
 
